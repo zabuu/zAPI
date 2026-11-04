@@ -3,10 +3,29 @@
 #include "../src/profiles/Profiles.cpp"
 using namespace zprofiles;
 #include <iostream>
+#include <cstdarg>
 
 namespace {
 int checks = 0, sent = 0, received = 0;
 zp::Bars delivered{};
+unsigned liveWrites = 0, actionUploads = 0, perSlotEvents = 0, fullBarEvents = 0;
+int failLiveSlotOnce = -1;
+bool invalidBarEvent = false;
+void __fastcall SetLiveAction(uint32_t slot, uint32_t action, uint32_t upload, uint32_t suppressNotify) {
+  ++liveWrites;
+  if (upload) ++actionUploads;
+  if (!suppressNotify) ++perSlotEvents;
+  if (slot >= 120) { invalidBarEvent = true; return; }
+  if (static_cast<int>(slot) == failLiveSlotOnce) { failLiveSlotOnce = -1; return; }
+  At<uint32_t *>(0xBC6980)[slot] = action;
+}
+void __cdecl BarEvent(uint32_t event, const char *format, ...) {
+  va_list args; va_start(args, format);
+  const int slot = va_arg(args, int); va_end(args);
+  if (event != 0xD5 || !format || std::strcmp(format, "%d") || slot != 0 || liveWrites % 120)
+    invalidBarEvent = true;
+  ++fullBarEvents;
+}
 std::array<uint8_t, 0xE70> fakePlayer{};
 std::array<uint8_t, 0x1030> fakeFields{};
 uintptr_t __stdcall LookupPlayer(uint64_t guid) { return guid == 42 ? reinterpret_cast<uintptr_t>(fakePlayer.data()) : 0; }
@@ -41,6 +60,12 @@ struct PlayerFixture {
     jump = At<uint8_t *>(0x5AF940);
     jump[0] = 0x68; target = reinterpret_cast<uintptr_t>(&CacheDigest);
     std::memcpy(jump + 1, &target, 4); jump[5] = 0xC3;
+    jump = At<uint8_t *>(0x4E5D60);
+    jump[0] = 0x68; target = reinterpret_cast<uintptr_t>(&SetLiveAction);
+    std::memcpy(jump + 1, &target, 4); jump[5] = 0xC3;
+    jump = At<uint8_t *>(0x703F50);
+    jump[0] = 0x68; target = reinterpret_cast<uintptr_t>(&BarEvent);
+    std::memcpy(jump + 1, &target, 4); jump[5] = 0xC3;
     FlushInstructionCache(GetCurrentProcess(), memory, 0x800000);
   }
   ~PlayerFixture() { image = previousImage; VirtualFree(memory, 0, MEM_RELEASE); }
@@ -53,6 +78,8 @@ void __fastcall Sent(void *, void *, Packet *) { ++sent; }
 void __fastcall Received(void *, void *, uint32_t, Packet *packet) {
   ++received;
   uint8_t *data = nullptr; size_t n = 0;
+  // The real 0x129 handler writes a login seed, not the live action table.
+  // Keeping these separate catches fake restores that only replay this packet.
   if (View(packet, &data, &n) && n == 2 + sizeof(zp::Bars)) std::memcpy(delivered.data(), data + 2, sizeof(zp::Bars));
 }
 std::string Contents(const zp::fs::path &path) {
@@ -184,7 +211,10 @@ void SetupTests(zp::Session &session) {
   Check(zp::SetupName(L"Frost PvP-2") && !zp::SetupName(std::wstring(33, L'x')), "setup names accept readable short labels");
   const std::string bindings = "ZPB1\n31\t414354494f4e425554544f4e31\n53484946542d31\t414354494f4e425554544f4e31\n";
   zp::Setup setup{session.bars, 5, bindings};
-  setup.bars[119] = 0x40000001; // macro on a hidden/stance page
+  setup.bars[0] = 116;
+  setup.bars[2] = 0x80001234; // item
+  setup.bars[118] = 0x41000001; // character macro
+  setup.bars[119] = 0x40000001; // account macro on a hidden/stance page
   auto path = zp::SetupPath(*store, session.account, session.guid, L"Frost");
   zp::WriteSetup(*store, path, setup);
   auto loaded = zp::ReadSetup(path);
@@ -224,24 +254,54 @@ void SetupTests(zp::Session &session) {
   {
     PlayerFixture player;
     fakeFields[0x102A] = 0xA9;
+    zp::Bars unsavedBars = oldBars;
+    unsavedBars[0] = unsavedBars[1] = 0; // removed spell and macro
+    unsavedBars[8] = 77; // unsaved extra spell, absent in the named setup
+    std::memcpy(At<void *>(0xBC6980), unsavedBars.data(), sizeof(unsavedBars));
+    const auto unsaved = CaptureSetup(session, bindings);
+    Check(unsaved.bars == unsavedBars && unsaved.bars != session.bars,
+      "Save and Undo capture the visible live slots even when the session journal differs");
+    zp::WriteSetup(*store, undoPath, unsaved);
+    const auto stagedBefore = delivered;
+    liveWrites = actionUploads = perSlotEvents = fullBarEvents = 0; invalidBarEvent = false;
     ApplySetup(session, setup);
+    Check(std::memcmp(At<void *>(0xBC6980), setup.bars.data(), sizeof(zp::Bars)) == 0,
+      "Apply restores the live action slots, not only the login staging packet");
     zp::Bars checkpoint{};
-    Check(delivered == setup.bars && session.bars == setup.bars, "named setup replays bars through the production receive adapter");
+    Check(delivered == stagedBefore && session.bars == setup.bars, "setup application updates live slots without replaying the login seed");
+    Check(liveWrites == 120 && !actionUploads && !perSlotEvents && fullBarEvents == 1 && !invalidBarEvent,
+      "all slots use the local setter with uploads disabled and one final full-bar refresh");
+    Check(At<uint32_t *>(0xBC6980)[0] == 116 && At<uint32_t *>(0xBC6980)[2] == 0x80001234 &&
+      At<uint32_t *>(0xBC6980)[118] == 0x41000001 && At<uint32_t *>(0xBC6980)[119] == 0x40000001,
+      "spell, item, character-macro and account-macro slots are restored in live memory");
     Check(fakeFields[0x102A] == 0xA5 && session.toggles == 5, "setup applies visibility without changing unrelated player bits");
     Check(store->LoadBars(session.account, session.guid, false, checkpoint) && checkpoint == setup.bars, "applied setup is persisted as the local action checkpoint");
     Check(sent == previousSent, "applying a setup sends no server edits");
     zp::Bars afterOfficial{};
     Check(store->LoadBars(session.account, session.guid, true, afterOfficial) && afterOfficial == official, "applying a setup retains the official Revert baseline");
+    ApplySetup(session, zp::ReadSetup(undoPath));
+    Check(std::memcmp(At<void *>(0xBC6980), unsavedBars.data(), sizeof(unsavedBars)) == 0,
+      "Undo restores unsaved removals and extra live slots");
+    auto broken = setup; broken.bars[5] = 133;
+    failLiveSlotOnce = 5;
+    refused = false;
+    try { ApplySetup(session, broken); } catch (...) { refused = true; }
+    Check(refused && std::memcmp(At<void *>(0xBC6980), unsavedBars.data(), sizeof(unsavedBars)) == 0 && session.bars == unsavedBars,
+      "failed live write is detected and rolls back the actual prior live slots");
+    Check(store->LoadBars(session.account, session.guid, false, checkpoint) && checkpoint == unsavedBars,
+      "failed application also rolls back its local checkpoint");
+    ApplySetup(session, setup);
     *At<uint8_t *>(0xB4B424) = 0;
     refused = false;
     auto unavailable = setup; unavailable.bars[0] = 123;
     try { ApplySetup(session, unavailable); } catch (...) { refused = true; }
     Check(refused && session.bars == setup.bars, "missing live player leaves the setup untouched");
+    *At<uint8_t *>(0xB4B424) = 1;
+    store->SaveBars(session.account, session.guid, false, oldBars);
+    Check(DeliverBars(session, oldBars), "live session can be restored after setup tests");
   }
   zp::DeleteSetup(*store, renamed);
-  Check(!zp::fs::exists(renamed) && zp::ReadSetup(undoPath).bars == setup.bars, "delete archives the named setup while retaining Undo");
-  store->SaveBars(session.account, session.guid, false, oldBars);
-  DeliverBars(session, oldBars);
+  Check(!zp::fs::exists(renamed) && zp::ReadSetup(undoPath).bars[8] == 77, "delete archives the named setup while retaining Undo");
 }
 void Tests(const zp::fs::path &root) {
   Check(!zp::Segment(L"..") && !zp::Segment(L"CON.txt") && !zp::Segment(L"x\\y"), "unsafe path segments rejected");
@@ -372,8 +432,11 @@ void Tests(const zp::fs::path &root) {
   SetupTests(session);
   Write(original / L"Realm/Otherchar/layout-cache.txt", "isolated other layout");
   store->Revert(L"TESTACCOUNT", L"Realm", L"Testchar", true);
-  Check(Replay(session), "current-character Revert replays official bars through client receive adapter");
-  Check(delivered == newer, "Revert restores latest official action bars");
+  {
+    PlayerFixture player;
+    Check(Replay(session), "current-character Revert applies official bars to the live action table");
+    Check(std::memcmp(At<void *>(0xBC6980), newer.data(), sizeof(newer)) == 0, "Revert restores latest official live action bars");
+  }
   SendHook(&connection, nullptr, &editPacket);
   Check(store->LoadBars(L"TESTACCOUNT", guid, false, saved) && saved == newer, "old UI action saves cannot overwrite reverted bar checkpoint");
   Check(Contents(profile / L"Realm/Testchar/layout-cache.txt") == "official character layout", "character Revert restores original files");
@@ -391,7 +454,7 @@ void Tests(const zp::fs::path &root) {
   session.account = L"NORMALACCOUNT";
   SendHook(&connection, nullptr, &editPacket);
   DispatchHook(&connection, nullptr, 7, &downloadPacket);
-  Check(sent == 3 && received == 7, "Default account network writes and cache reads pass through");
+  Check(sent == 3 && received == 4, "Default account network writes and cache reads pass through");
   store->Mode(L"TESTACCOUNT", false);
   Check(store->Isolated(L"TESTACCOUNT"), "disabling isolation does not upload an in-memory isolated session");
   store->Mode(L"TESTACCOUNT", true); // retain isolation for abrupt-exit child

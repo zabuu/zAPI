@@ -1,4 +1,4 @@
-# Profile module (zAPI 3.2)
+# Profile module (zAPI 3.5)
 
 The zProfiles native module is part of **zAPI.dll**. Install that single DLL
 first in `dlls.txt`, remove the old `zProfilesNative.dll` loader entry, and
@@ -15,6 +15,22 @@ selection, identification/resume, bar visibility and Revert. Named setup
 commands cover listing, Save, Update, Rename, Delete, Apply and Undo with
 binding payload validation. Existing storage formats and account modes remain
 compatible. New zProfiles checks the merged capability before enabling controls.
+
+`zProfilesNative("liveBarsVersion")` returns `1` for verified live bar capture
+and restoration. New setup controls require this capability. Apply and live
+Revert use the audited local setter at `0x4E5D60` for all 120 slots, with
+server upload disabled and per-slot notifications suppressed, then emit one
+`ACTIONBAR_SLOT_CHANGED(0)` through `0x703F50`. This also updates the client's
+derived item/action caches. Readback verifies the live table at `0xBC6980`
+before reporting success; failed writes roll back the actual prior live slots.
+Save and Undo read that live table rather than relying on the packet journal.
+
+The incoming `0x129` handler at `0x5E6680` only fills the login seed at
+`0xC4C2B4`; replaying it after login does not apply slots to a playing character.
+The previous mock dispatcher checked seed delivery and missed this distinction.
+The regression fixture now keeps seed and live state separate and checks spells,
+items, account/character macros, empty slots, hidden pages, Undo, upload flags,
+one final refresh and rollback after a failed live write.
 
 One synchronous exported `Load` initializes the shared MinHook instance,
 profile file/settings hooks and the sole Lua-registration detour before login.
@@ -33,7 +49,7 @@ diagnostics. Every unconfigured account remains Default. Modes take effect
 after a full client restart. Removing only the Lua addon does not disable
 native isolation: select Use Default for isolated accounts before removing it.
 
-Validation includes 138 native profile checks with actual Win32 file detours,
+Validation includes 146 native profile checks with actual Win32 file detours,
 generated account fixtures and forced process termination; the shared
 registration/reload/render-chain fixture; and the addon Lua regression suite.
 No test uses real account data. Live login, interoperability and remote server

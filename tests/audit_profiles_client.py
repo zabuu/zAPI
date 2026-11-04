@@ -41,6 +41,20 @@ def audit(path):
     signature(0x537AA0, '55 8b ec 8b 15 6c d4 c0 00 53 8b 5d 0c 56 57 8d')
     signature(0x704120, '56 57 8b f9 e8 a7 ff ff ff 8b f0 6a 00 8b ce')
     signature(0x4E7686, '8b 80 68 0e 00 00 8a 98 2a 10 00 00')
+    # 0x129 fills a login-only seed. Live slot getters and the local setter
+    # instead use 0xBC6980. Setter arguments are (slot, raw, upload, suppress).
+    signature(0x5E6689, 'be b4 c2 c4 00 bf 78 00 00 00 56 8b cb')
+    signature(0x4E6DD3, '8b 04 b5 80 69 bc 00')
+    signature(0x4E5D60, '55 8b ec 56 8b f1 85 f6 7c 40 83 fe 78 73 3b 85 d2 89 14 b5 80 69 bc 00')
+    signature(0x4E5D9C, '8b 4d 0c 8b 55 08 51 8b ce')
+    call(0x4E5DA5, 0x4E58E0)
+    signature(0x4E5908, '3b df 89 04 b5 60 6b bc 00 8b 45 fc 89 04 b5 a0 67 bc 00 74 6a')
+    signature(0x4E5987, '39 7d 08 75 14 46 56 68 54 51 83 00 68 d5 00 00 00')
+    signature(0x5DEAF7, '8b 16 8b 4d fc 6a 01 6a 00')
+    call(0x5DEB00, 0x4E5D60)
+    signature(0x5DEB14, '6a 00 68 54 51 83 00 68 d5 00 00 00')
+    call(0x5DEB20, 0x703F50)
+    signature(0x703F50, '55 8b ec 8b 15 68 ef ce 00')
     # The stock setter composes four low bits then sends opcode 0x2BF.
     signature(0x4E771D, '68 bf 02 00 00')
     # Login UI executes a fixed Lua chunk in the caller's glue state.

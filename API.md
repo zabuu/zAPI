@@ -406,3 +406,16 @@ from its own account first, then the template. Nonempty bindings, other
 accounts' original files, macros and bars are not overwritten. An absent
 template keeps the original clone policy and can use the destination's own
 account bindings for an empty character file.
+
+## Version 3.5: live action-bar restoration
+
+`zAPI("version")` returns `3.5`. The profile bridge additionally exposes
+`zProfilesNative("liveBarsVersion") == 1`; the existing setup payload format
+and command contract remain compatible.
+
+Setup Apply and live Revert now use the audited local action-slot setter with
+uploads disabled, refresh derived caches and emit one full bar update. Readback
+of the live table must match the target before success is returned. Save and
+Undo capture live slots, and failed application restores the prior live state.
+The previous packet replay only changed a login seed and could report success
+without changing playing characters' bars. Existing saved setups remain usable.

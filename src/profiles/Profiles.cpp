@@ -212,18 +212,41 @@ zp::Session *CurrentSession() {
 bool ReplayReady(const zp::Session &session) {
   return replayConnection == currentConnection && replayGuid == session.guid && replayPrototype.vtable;
 }
+bool ReadLiveBars(uint64_t guid, zp::Bars &bars) noexcept {
+  uint8_t flags = 0;
+  if (!PlayerFlags(guid, &flags, false)) return false;
+  __try {
+    // Script_HasAction and the action getters read this table. The 0x129
+    // handler instead writes 0xC4C2B4, a seed used only during world entry.
+    std::memcpy(bars.data(), At<const void *>(0x00BC6980), sizeof(bars));
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+zp::Setup CaptureSetup(const zp::Session &session, const std::string &bindings) {
+  zp::Setup setup;
+  if (!ReadLiveBars(session.guid, setup.bars)) throw std::runtime_error("Live action bars are not available for saving.");
+  setup.toggles = session.toggles;
+  setup.bindings = bindings;
+  return setup;
+}
 bool DeliverBars(zp::Session &session, const zp::Bars &bars) {
   if (!ReplayReady(session)) return false;
-  std::array<uint8_t, 2 + sizeof(zp::Bars)> bytes{};
-  uint16_t opcode = static_cast<uint16_t>(zp::ActionButtons);
-  std::memcpy(bytes.data(), &opcode, 2);
-  std::memcpy(bytes.data() + 2, bars.data(), sizeof(bars));
-  Packet packet = replayPrototype;
-  packet.buffer = bytes.data(); packet.base = packet.read = 0;
-  packet.allocated = packet.size = static_cast<uint32_t>(bytes.size());
-  session.bars = bars; session.ready = true;
-  originalDispatch(replayConnection, nullptr, replayArgument, &packet);
-  return true;
+  uint8_t flags = 0;
+  if (!PlayerFlags(session.guid, &flags, false)) return false;
+  using SetAction = void(__fastcall *)(uint32_t, uint32_t, uint32_t, uint32_t);
+  using Signal = void(__cdecl *)(uint32_t, const char *, ...);
+  __try {
+    for (uint32_t slot = 0; slot < bars.size(); ++slot) {
+      // Audited client setter: update the live slot and derived caches,
+      // suppress server upload and defer notifications until the batch ends.
+      At<SetAction>(0x004E5D60)(slot, bars[slot], 0, 1);
+    }
+    if (std::memcmp(At<const void *>(0x00BC6980), bars.data(), sizeof(bars))) return false;
+    session.bars = bars; session.ready = true;
+    // Same full-refresh event used after the client's login seed is applied.
+    At<Signal>(0x00703F50)(0xD5, "%d", 0); // ACTIONBAR_SLOT_CHANGED(0)
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool Replay(zp::Session &session) {
   if (replayConnection != currentConnection || replayGuid != session.guid || !replayPrototype.vtable) return false;
@@ -243,9 +266,9 @@ bool Replay(zp::Session &session) {
 }
 void ApplySetup(zp::Session &session, const zp::Setup &setup) {
   uint8_t previousFlags = 0;
-  if (!ReplayReady(session) || !PlayerFlags(session.guid, &previousFlags, false))
+  zp::Bars previousBars{};
+  if (!ReplayReady(session) || !PlayerFlags(session.guid, &previousFlags, false) || !ReadLiveBars(session.guid, previousBars))
     throw std::runtime_error("Live action bars are not available. Log out and back in before applying a setup.");
-  const auto previousBars = session.bars;
   auto flagsFile = store->Journal(session.account, session.guid, false); flagsFile += L".toggles";
   try {
     store->SaveBars(session.account, session.guid, false, setup.bars);
@@ -280,6 +303,7 @@ int __fastcall Bridge(void *L) {
     auto command = Argument(L, 1);
     if (command == "version") { Number(L, 1); return 1; }
     if (command == "setupVersion") { Number(L, 1); return 1; }
+    if (command == "liveBarsVersion") { Number(L, 1); return 1; }
     std::lock_guard<std::recursive_mutex> lock(store->mutex);
     auto current = CurrentSession();
     if (command == "bindingTemplate") { Text(L, zp::Utf8(store->BindingTemplate())); return 1; }
@@ -308,7 +332,7 @@ int __fastcall Bridge(void *L) {
       if (command == "saveSetup" || command == "updateSetup" || command == "saveSetupUndo") {
         if (command == "saveSetup" && zp::fs::exists(path)) return Reply(L, false, "That name already exists. Select it and use Update, or choose another name.");
         if (command == "updateSetup" && !zp::fs::exists(path)) return Reply(L, false, "The selected setup no longer exists.");
-        zp::Setup setup{current->bars, current->toggles, Argument(L, 3)};
+        auto setup = CaptureSetup(*current, Argument(L, 3));
         zp::WriteSetup(*store, path, setup);
         return Reply(L, true, undo ? "Undo saved." : "Saved setup: " + zp::Utf8(name));
       }
@@ -519,10 +543,18 @@ bool Compatible() noexcept {
     static const uint8_t dispatch[] = {0x55,0x8B,0xEC,0x8B,0x15,0x6C,0xD4,0xC0,0x00,0x53,0x8B,0x5D,0x0C,0x56,0x57,0x8D};
     static const uint8_t registration[] = {0x56,0x57,0x8B,0xF9,0xE8,0xA7,0xFF,0xFF,0xFF,0x8B,0xF0,0x6A,0x00,0x8B,0xCE};
     static const uint8_t flags[] = {0x8B,0x80,0x68,0x0E,0x00,0x00,0x8A,0x98,0x2A,0x10,0x00,0x00};
+    static const uint8_t setter[] = {0x55,0x8B,0xEC,0x56,0x8B,0xF1,0x85,0xF6,0x7C,0x40,0x83,0xFE,0x78,0x73,0x3B,0x85,0xD2,0x89,0x14,0xB5,0x80,0x69,0xBC,0x00};
+    static const uint8_t setterFlags[] = {0x8B,0x4D,0x0C,0x8B,0x55,0x08,0x51,0x8B,0xCE,0xE8,0x36,0xFB,0xFF,0xFF};
+    static const uint8_t live[] = {0x8B,0x04,0xB5,0x80,0x69,0xBC,0x00};
+    static const uint8_t signal[] = {0x55,0x8B,0xEC,0x8B,0x15,0x68,0xEF,0xCE,0x00};
     return std::memcmp(At<void *>(0x005379A0), send, sizeof(send)) == 0 &&
       std::memcmp(At<void *>(0x00537AA0), dispatch, sizeof(dispatch)) == 0 &&
       std::memcmp(At<void *>(0x00704120), registration, sizeof(registration)) == 0 &&
-      std::memcmp(At<void *>(0x004E7686), flags, sizeof(flags)) == 0;
+      std::memcmp(At<void *>(0x004E7686), flags, sizeof(flags)) == 0 &&
+      std::memcmp(At<void *>(0x004E5D60), setter, sizeof(setter)) == 0 &&
+      std::memcmp(At<void *>(0x004E5D9C), setterFlags, sizeof(setterFlags)) == 0 &&
+      std::memcmp(At<void *>(0x004E6DD3), live, sizeof(live)) == 0 &&
+      std::memcmp(At<void *>(0x00703F50), signal, sizeof(signal)) == 0;
   } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 DWORD Prepare() {
@@ -540,7 +572,7 @@ DWORD Prepare() {
       !zp::files::Install(store.get())) {
     throw std::runtime_error("Protection could not be installed completely. Startup stopped before login.");
   }
-  Log("zAPI 3.4 profile protection prepared; account modes default unless explicitly isolated.");
+  Log("zAPI 3.5 profile protection prepared; account modes default unless explicitly isolated.");
   return 0;
 }
 void ProcessDetach(bool processExit) {

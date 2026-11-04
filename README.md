@@ -1,6 +1,8 @@
 # zAPI
 
-**Native version 3.4 — fixes login/cache initialization and supports default keybindings.**
+**Native version 3.5 — fixes live action-bar setup restoration, including spells and macros.**
+
+Version 3.5 applies saved slots through the client's local action setter and refreshes the live bars. Earlier setup Apply calls updated a login staging table without changing the visible slots. Existing saved setups remain compatible; Save and Undo now capture live slots as well. Upload suppression, 3.4 cache initialization and existing-binding precedence are retained. Fully restart WoW after replacing the DLL.
 
 Shared native DLL for zSuite on **Windows, 32-bit WoW 1.12.1.5875**, as used by
 OctoWoW. Install one copy for all compatible addons. This repository owns the
