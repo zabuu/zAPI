@@ -131,6 +131,54 @@ class Store {
   }
   ~Store() { Bypass guard; for (auto &entry : locks) CloseHandle(entry.second); }
   fs::path Profile(const std::wstring &account) const { return data / L"profiles" / account; }
+  std::wstring BindingTemplate() const {
+    Bypass guard;
+    auto file = data / L"binding-template.txt";
+    if (!fs::exists(file)) return {};
+    PlainDirectory(file);
+    auto bytes = ReadBytes(file, 512);
+    std::istringstream input(std::string(bytes.begin(), bytes.end()));
+    std::string header, name;
+    if (!std::getline(input, header) || header != "ZPROFILES BINDING TEMPLATE 1" || !std::getline(input, name))
+      throw std::runtime_error("Invalid binding template account.");
+    if (!name.empty() && name.back() == '\r') name.pop_back();
+    auto account = Upper(Wide(name));
+    if (!Account(account)) throw std::runtime_error("Invalid binding template account.");
+    return account;
+  }
+  std::string TemplateBindings() const {
+    Bypass guard;
+    const auto source = BindingTemplate();
+    if (source.empty()) return {};
+    for (const auto &root : {Profile(source), original / source}) {
+      auto file = root / L"bindings-cache.wtf";
+      PlainDirectory(file);
+      if (!fs::exists(file) || !fs::file_size(file)) continue;
+      auto bytes = ReadBytes(file, 1024 * 1024);
+      return std::string(bytes.begin(), bytes.end());
+    }
+    return {};
+  }
+  void SetBindingTemplate(std::wstring account) {
+    Bypass guard;
+    account = Upper(account);
+    const auto visible = Accounts();
+    if (!Account(account) || std::find(visible.begin(), visible.end(), account) == visible.end())
+      throw std::runtime_error("Choose a visible account as the binding template.");
+    AtomicWrite(data / L"binding-template.txt", "ZPROFILES BINDING TEMPLATE 1\n" + Utf8(account) + "\n");
+  }
+  void SeedEmptyBindings(const fs::path &file, const std::wstring &account) {
+    Bypass guard;
+    if (Upper(file.filename().wstring()) != L"BINDINGS-CACHE.WTF" || (fs::exists(file) && fs::file_size(file))) return;
+    std::string text;
+    auto accountFile = Profile(account) / L"bindings-cache.wtf";
+    if (file != accountFile && fs::exists(accountFile)) {
+      auto bytes = ReadBytes(accountFile, 1024 * 1024);
+      text.assign(bytes.begin(), bytes.end());
+    }
+    if (text.empty()) text = TemplateBindings();
+    if (!text.empty()) AtomicWrite(file, text);
+  }
   std::set<std::wstring> ReadModes() const {
     Bypass guard;
     std::set<std::wstring> out;
@@ -190,6 +238,7 @@ class Store {
       if (!fs::exists(profile)) {
         auto staging = Unique(L"staging", account);
         CopyTree(original / account, staging);
+        SeedEmptyBindings(staging / L"bindings-cache.wtf", account);
         AtomicWrite(staging / L".zprofiles-ready", "ZPROFILES 1\n");
         fs::create_directories(profile.parent_path());
         if (!MoveFileExW(staging.c_str(), profile.c_str(), MOVEFILE_WRITE_THROUGH)) throw std::runtime_error("Cannot activate profile clone.");
@@ -227,6 +276,7 @@ class Store {
     auto relative = slash == std::wstring::npos ? L"" : tail.substr(slash + 1);
     if (!relative.empty()) mapped /= relative;
     PlainDirectory(mapped);
+    if (!writing) SeedEmptyBindings(mapped, account);
     if (writing) for (const auto &scope : muted) if (Within(absolute, scope)) {
       mapped = data / L"discard" / std::to_wstring(GetCurrentProcessId()) / account / relative;
       fs::create_directories(mapped.parent_path());

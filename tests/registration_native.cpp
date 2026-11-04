@@ -18,6 +18,14 @@ int main() {
   assert(registered.size() == 2 && registered[0].first == "GetBuildInfo");
   assert(registered[1].first == "zProfilesNative" && registered[1].second == &zprofiles::Bridge);
   registered.clear();
+  RegisterFunctionHook("GetSavedAccountName", &Dummy);
+  assert(registered.size() == 3 && registered[0].second == &zprofiles::SavedNameHook);
+  assert(registered[1].first == "zLoginHistory" && registered[1].second == &zprofiles::LoginHistoryBridge);
+  assert(registered[2].first == "zLoginCreateFrame");
+  registered.clear();
+  RegisterFunctionHook("SetSavedAccountName", &Dummy);
+  assert(registered.size() == 1 && registered[0].second == &zprofiles::SetSavedNameHook);
+  registered.clear();
   RegisterFunctionHook("GetActionBarToggles", zprofiles::At<zprofiles::CFunction>(0x004E7660));
   assert(registered.size() == 1 && registered[0].second == &zprofiles::GetTogglesHook);
   assert(zprofiles::originalGetToggles == zprofiles::At<zprofiles::CFunction>(0x004E7660));

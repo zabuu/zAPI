@@ -4,10 +4,13 @@ $taskOutput = Join-Path $PSScriptRoot 'build'
 $taskMinhook = Join-Path $PSScriptRoot 'vendor\minhook'
 $taskVcvars = & (Join-Path $PSScriptRoot 'Find-Vcvars.ps1')
 New-Item -ItemType Directory -Path $taskOutput -Force | Out-Null
+$taskLoginLua = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'src\login\RecentNames.lua') -Raw
+$taskLoginHeader = '#pragma once' + "`n" + 'inline constexpr char kLoginUI[] = R"ZLOGINUI(' + $taskLoginLua + ')ZLOGINUI";' + "`n"
+[IO.File]::WriteAllText((Join-Path $taskOutput 'LoginUI.h'), $taskLoginHeader, [Text.UTF8Encoding]::new($false))
 $taskMinhookSources = @('src\buffer.c','src\hook.c','src\trampoline.c','src\hde\hde32.c') | ForEach-Object { Join-Path $taskMinhook $_ }
 $taskSources = @((Join-Path $PSScriptRoot 'src\zAPI.cpp'), (Join-Path $PSScriptRoot 'src\profiles\Profiles.cpp')) + $taskMinhookSources
 $taskInputs = ($taskSources | ForEach-Object { '"' + $_ + '"' }) -join ' '
-$taskOptions = '/nologo /O2 /MT /EHsc /std:c++17 /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /I"' + (Join-Path $taskMinhook 'include') + '" /I"' + (Join-Path $taskMinhook 'src') + '" '
+$taskOptions = '/nologo /O2 /MT /EHsc /std:c++17 /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /I"' + (Join-Path $taskMinhook 'include') + '" /I"' + (Join-Path $taskMinhook 'src') + '" /I"' + $taskOutput + '" '
 $taskCommand = 'call "' + $taskVcvars + '" x86 >nul && cl /LD ' + $taskOptions + $taskInputs + ' /link /DEF:"' + (Join-Path $PSScriptRoot 'src\zAPI.def') + '" /OUT:"' + (Join-Path $taskOutput 'zAPI.dll') + '" user32.lib kernel32.lib'
 Push-Location -LiteralPath $taskOutput
 try {

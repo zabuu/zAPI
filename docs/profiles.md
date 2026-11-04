@@ -33,7 +33,7 @@ diagnostics. Every unconfigured account remains Default. Modes take effect
 after a full client restart. Removing only the Lua addon does not disable
 native isolation: select Use Default for isolated accounts before removing it.
 
-Validation includes 106 native profile checks with actual Win32 file detours,
+Validation includes 138 native profile checks with actual Win32 file detours,
 generated account fixtures and forced process termination; the shared
 registration/reload/render-chain fixture; and the addon Lua regression suite.
 No test uses real account data. Live login, interoperability and remote server

@@ -368,3 +368,41 @@ one MinHook owner and one Lua registration hook. File/settings hooks start
 before login. Rendering hooks chain through later-loaded mods at stock world
 API registration; reloading Lua registers both bridges again without reinstalling
 process hooks. No separate zProfilesNative.dll is loaded or distributed.
+
+## Version 3.3: login packet buffers and username history
+
+`zAPI("version")` returns `3.3`. Incoming `CDataStore` buffers with
+`allocated == UINT32_MAX` are borrowed, not oversized. The adapter bounds their
+logical size/cursor window and retains the capacity check for owned buffers.
+Valid authentication traffic passes unchanged; isolated action/account-data
+packets still follow their existing protection rules. Tests use the borrowed
+layout for auth responses, action bars, timestamps and blocked account downloads.
+
+The login-only `zLoginHistory()` bridge supports `version` (1), `list` (a
+newline-delimited string and success flag), and `clear` (success flag). The
+normal `GetSavedAccountName`/`SetSavedAccountName` bindings retain their original
+return values and arguments; the getter installs a fixed embedded dropdown UI,
+and the setter remembers only the username provided to that existing API.
+No login submission or password API is wrapped. A helper exposes the stock
+frame constructor where glue lacks a `CreateFrame` global. Storage holds at
+most five unique uppercase account names and uses an atomic file plus a short
+exclusive file lock for clients sharing a game directory.
+
+## Version 3.4: local cache checksums and binding templates
+
+This client's `SMSG_ACCOUNT_DATA_TIMES` handler at `0x5AF8E0` consumes eight
+16-byte MD5 digests. Treating it as a 32-byte timestamp packet prevented
+normal cache/binding initialization. The adapter now uses the same file-kind
+table and native digest routine as that handler, with local file routing in
+force, and substitutes the local digests before dispatch. The client can
+initialize its local settings without a server download; settings uploads
+remain blocked for isolated accounts. Unexpected packet sizes fail closed.
+
+`zProfilesNative("bindingTemplate")` returns the configured account name;
+`zProfilesNative("setBindingTemplate", account)` chooses a visible account.
+New profile staging retains existing account bindings, using the template only
+for an empty/missing account file. Read routing fills an empty character file
+from its own account first, then the template. Nonempty bindings, other
+accounts' original files, macros and bars are not overwritten. An absent
+template keeps the original clone policy and can use the destination's own
+account bindings for an empty character file.

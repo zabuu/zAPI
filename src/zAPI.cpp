@@ -1272,7 +1272,7 @@ int __fastcall Script_zAPI(void *L) {
   }
 
   if (std::strcmp(command, "version") == 0) {
-    LuaPushNumber(L, 3.2);
+    LuaPushNumber(L, 3.4);
     return 1;
   }
   if (std::strcmp(command, "profilesVersion") == 0) {

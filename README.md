@@ -1,6 +1,6 @@
 # zAPI
 
-**Native version 3.2 — includes zProfiles protection and setup storage.**
+**Native version 3.4 — fixes login/cache initialization and supports default keybindings.**
 
 Shared native DLL for zSuite on **Windows, 32-bit WoW 1.12.1.5875**, as used by
 OctoWoW. Install one copy for all compatible addons. This repository owns the
@@ -83,6 +83,35 @@ not supported. Use the addon-specific status commands for feature compatibility.
 | [zBox](https://github.com/zabuu/zBox) | World positions, camera projection and terrain traces. |
 | zPet | Native pet commands, nearby discovery and positioning. |
 | OctoGC / OctoPerf | GC controls and optional native diagnostics. |
+
+## Recent usernames on the login screen
+
+Click the arrow inside the account-name field to choose from the **five most
+recent remembered usernames**. Selecting one fills the field and focuses the
+password box. You can still type a different name normally.
+
+Leave **Remember Account Name** checked when logging in to add or refresh that
+name in the list. Existing stock remembered names seed a new history. **Clear
+saved usernames** clears the list and the stock remembered name. The history is
+local to this game folder, in `WTF/zAPI/login-usernames.txt`, and works before
+any character addon loads. **Passwords are never read or stored by this feature.**
+History failures leave ordinary login available and do not alter account modes.
+
+## Default keybindings for new profiles
+
+An optional local template account supplies keybindings **only when the
+destination account has none**. Existing account and character bindings always
+take priority, including on first login. An empty or missing character-binding
+file first inherits its own account's bindings, then the template if that account
+is empty too. The template's current isolated bindings take priority over its
+original file. Macros, action bars and other addon settings remain specific to
+the destination account.
+
+Choose a visible account with
+`/run zProfilesNative("setBindingTemplate", "ACCOUNT")` and replace `ACCOUNT`
+with its name. The selection persists in `WTF/zProfiles/binding-template.txt`.
+Default-mode accounts keep normal behavior. The template is a starting point;
+later binding changes are not continuously synchronized between accounts.
 
 ## Source and development
 

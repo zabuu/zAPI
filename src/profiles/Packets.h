@@ -37,14 +37,15 @@ struct Session {
     }
     return false;
   }
-  bool Receive(Store &store, uint32_t opcode, uint8_t *body, size_t size) {
+  bool Receive(Store &store, uint32_t opcode, uint8_t *body, size_t size, const uint8_t *localDigests = nullptr) {
     if (!store.Isolated(account)) return true;
     if (opcode == ServerAccountData) return false;
     if (opcode == AccountDataTimes) {
-      if (!body || size != 32) throw std::runtime_error("Unsupported account-data timestamps; no server settings were imported.");
-      // The local clone is authoritative on this machine. Zero server times
-      // prevent the cache synchronizer choosing a newer server copy.
-      std::memset(body, 0, size);
+      // The audited 1.12 handler reads eight 16-byte MD5 digests, not eight
+      // u32 timestamps. Match the local files so normal cache initialization
+      // proceeds without downloading server settings or uploading local edits.
+      if (!body || size != 128 || !localDigests) throw std::runtime_error("Unsupported account-data checksum table; no server settings were imported.");
+      std::memcpy(body, localDigests, size);
     } else if (opcode == ActionButtons) {
       if (!guid || !body || size != sizeof(Bars)) throw std::runtime_error("Unsupported action-bar seed packet.");
       Bars official{};

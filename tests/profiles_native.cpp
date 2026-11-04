@@ -10,6 +10,12 @@ zp::Bars delivered{};
 std::array<uint8_t, 0xE70> fakePlayer{};
 std::array<uint8_t, 0x1030> fakeFields{};
 uintptr_t __stdcall LookupPlayer(uint64_t guid) { return guid == 42 ? reinterpret_cast<uintptr_t>(fakePlayer.data()) : 0; }
+unsigned digestReads = 0;
+void __fastcall CacheDigest(uint8_t kind, const char *name, uint8_t *output) {
+  if (!name || std::strcmp(name, "fixture-cache")) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+  ++digestReads;
+  for (unsigned i = 0; i < 16; ++i) output[i] = static_cast<uint8_t>(kind * 16 + i + 1);
+}
 struct PlayerFixture {
   void *memory = VirtualAlloc(nullptr, 0x800000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
   uintptr_t previousImage = image;
@@ -26,6 +32,14 @@ struct PlayerFixture {
     auto jump = At<uint8_t *>(0x464870);
     jump[0] = 0x68;
     auto target = reinterpret_cast<uintptr_t>(&LookupPlayer);
+    std::memcpy(jump + 1, &target, 4); jump[5] = 0xC3;
+    for (unsigned i = 0; i < 8; ++i) {
+      auto row = At<uint8_t *>(0x85DCF0) + i * 0x2C;
+      row[0] = static_cast<uint8_t>(i);
+      *reinterpret_cast<const char **>(row + 8) = "fixture-cache";
+    }
+    jump = At<uint8_t *>(0x5AF940);
+    jump[0] = 0x68; target = reinterpret_cast<uintptr_t>(&CacheDigest);
     std::memcpy(jump + 1, &target, 4); jump[5] = 0xC3;
     FlushInstructionCache(GetCurrentProcess(), memory, 0x800000);
   }
@@ -60,8 +74,30 @@ std::vector<uint8_t> Message(uint32_t opcode, const void *body, size_t length, s
   if (length) std::memcpy(bytes.data() + opcodeSize, body, length);
   return bytes;
 }
-Packet Wrap(std::vector<uint8_t> &bytes) {
-  return {reinterpret_cast<void *>(1), bytes.data(), 0, static_cast<uint32_t>(bytes.size()), static_cast<uint32_t>(bytes.size()), 0};
+Packet Wrap(std::vector<uint8_t> &bytes, bool borrowed = false) {
+  return {reinterpret_cast<void *>(1), bytes.data(), 0, borrowed ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes.size()), static_cast<uint32_t>(bytes.size()), 0};
+}
+void PacketWindowTests() {
+  std::vector<uint8_t> bytes(12, 0);
+  uint8_t *data = nullptr; size_t length = 0;
+  auto packet = Wrap(bytes, true);
+  Check(View(&packet, &data, &length) && data == bytes.data() && length == 12, "borrowed CDataStore ownership marker is not an allocation size");
+  packet.base = packet.read = 100; packet.size = 112;
+  Check(View(&packet, &data, &length) && data == bytes.data() && length == 12, "borrowed buffer supports a nonzero logical base");
+  packet.read = 102;
+  Check(View(&packet, &data, &length) && data == bytes.data() + 2 && length == 10, "borrowed read cursor preserves the remaining logical window");
+  packet.read = 99;
+  Check(!View(&packet, &data, &length), "borrowed cursor before base is rejected");
+  packet.read = 113;
+  Check(!View(&packet, &data, &length), "borrowed cursor beyond size is rejected");
+  packet.read = 100; packet.size = 100 + 16 * 1024 * 1024 + 1;
+  Check(!View(&packet, &data, &length), "borrowed windows retain the size bound");
+  packet = Wrap(bytes); packet.allocated = 11;
+  Check(!View(&packet, &data, &length), "owned windows cannot exceed their actual allocation");
+  packet.allocated = 16 * 1024 * 1024 + 1;
+  Check(!View(&packet, &data, &length), "unknown large allocation values remain rejected");
+  packet = Wrap(bytes, true); packet.read = 0xFFFFFFFFu;
+  Check(!View(&packet, &data, &length), "unfinished write cursors cannot be mistaken for readable packets");
 }
 struct HookScope {
   HookScope() {
@@ -81,6 +117,66 @@ void Fixture(const zp::fs::path &root) {
   Check(initial.active.empty(), "no profile means Default");
   initial.Mode(L"testaccount", true);
   Check(!initial.Isolated(L"TESTACCOUNT"), "mode changes do not enable isolation mid-session");
+}
+void UsernameHistoryTests(const zp::fs::path &root) {
+  zlogin::UsernameHistory first(root), second(root);
+  Check(first.Names().empty(), "new username history starts empty");
+  first.Remember("one"); second.Remember("Two");
+  Check(first.Names() == std::vector<std::string>({"TWO", "ONE"}), "instances merge current disk history and normalize account casing");
+  first.Remember("one");
+  Check(second.Names() == std::vector<std::string>({"ONE", "TWO"}), "reused usernames move to the front without duplicates");
+  for (const auto &name : {"THREE", "FOUR", "FIVE", "SIX"}) second.Remember(name);
+  const auto names = first.Names();
+  Check(names == std::vector<std::string>({"SIX", "FIVE", "FOUR", "THREE", "ONE"}), "history retains exactly five most recent unique usernames");
+  first.Remember("OLD", true);
+  Check(first.Names() == names, "stock saved-account seeding cannot reorder an existing history");
+  first.Remember("wrong\nname"); first.Remember("bad|markup"); first.Remember(std::string(65, 'A'));
+  Check(first.Names() == names, "control characters, UI markup and oversized names are not persisted");
+  first.Clear();
+  Check(second.Names().empty(), "clear history persists across instances");
+  second.Remember("SavedAccount", true);
+  Check(first.Names() == std::vector<std::string>({"SAVEDACCOUNT"}), "existing stock remembered account can seed an empty history");
+  auto file = root / L"WTF/zAPI/login-usernames.txt";
+  zp::AtomicWrite(file, "corrupt history");
+  bool refused = false;
+  try { first.Names(); } catch (...) { refused = true; }
+  Check(refused, "damaged history is never interpreted as account names or executable code");
+  first.Clear();
+  Check(second.Names().empty(), "clear can recover a damaged username history");
+}
+void BindingTemplateTests(const zp::fs::path &root) {
+  auto game = root / L"binding-template-fixture";
+  const std::string official = "bind ESCAPE TOGGLEGAMEMENU\nbind W MOVEFORWARD\n";
+  const std::string current = official + "bind F1 TARGETSELF\n";
+  zp::AtomicWrite(game / L"WTF/Account/ZABUU/bindings-cache.wtf", official);
+  zp::AtomicWrite(game / L"WTF/Account/NEWACCOUNT/bindings-cache.wtf", "bind SPACE JUMP\n");
+  zp::AtomicWrite(game / L"WTF/Account/NEWACCOUNT/Realm/Newchar/bindings-cache.wtf", "");
+  zp::AtomicWrite(game / L"WTF/Account/NEWACCOUNT/Realm/Custom/bindings-cache.wtf", "bind E CUSTOM\n");
+  zp::AtomicWrite(game / L"WTF/Account/NEWACCOUNT/macros-cache.txt", "own account macros");
+  zp::AtomicWrite(game / L"WTF/Account/DEFAULT/bindings-cache.wtf", "default account keys");
+  zp::AtomicWrite(game / L"WTF/zProfiles/profiles/ZABUU/bindings-cache.wtf", current);
+  zp::Store initial(game);
+  initial.SetBindingTemplate(L"zabuu"); initial.Mode(L"NEWACCOUNT", true);
+  zp::Store isolated(game);
+  Check(isolated.BindingTemplate() == L"ZABUU", "binding template account persists across client sessions");
+  isolated.EnsureProfile(L"NEWACCOUNT");
+  Check(Contents(isolated.Profile(L"NEWACCOUNT") / L"bindings-cache.wtf") == "bind SPACE JUMP\n", "new profile preserves an account's existing bindings on first login");
+  auto empty = game / L"WTF/Account/NEWACCOUNT/Realm/Newchar/bindings-cache.wtf";
+  auto seeded = isolated.Route(empty.wstring(), false);
+  Check(Contents(seeded) == "bind SPACE JUMP\n", "empty character bindings inherit their own account bindings before any template");
+  Check(Contents(empty).empty(), "seeding does not change the official empty character file");
+  auto custom = game / L"WTF/Account/NEWACCOUNT/Realm/Custom/bindings-cache.wtf";
+  Check(Contents(isolated.Route(custom.wstring(), false)) == "bind E CUSTOM\n", "existing nonempty character bindings are preserved");
+  Check(Contents(isolated.Profile(L"NEWACCOUNT") / L"macros-cache.txt") == "own account macros", "binding defaults never copy the template account's macros");
+  Check(Contents(game / L"WTF/Account/NEWACCOUNT/bindings-cache.wtf") == "bind SPACE JUMP\n", "template seeding leaves the account's official bindings intact");
+  Check(isolated.Route((game / L"WTF/Account/DEFAULT/bindings-cache.wtf").wstring(), false) == (game / L"WTF/Account/DEFAULT/bindings-cache.wtf").wstring(), "Default-mode accounts are not seeded or redirected");
+  zp::AtomicWrite(zp::fs::path(seeded), "bind Q USERCHANGED\n");
+  Check(Contents(isolated.Route(empty.wstring(), false)) == "bind Q USERCHANGED\n", "a template is a starting point and never overwrites later custom bindings");
+  zp::AtomicWrite(game / L"WTF/Account/EMPTY/bindings-cache.wtf", "");
+  isolated.Mode(L"EMPTY", true);
+  { zp::Store fresh(game); fresh.EnsureProfile(L"EMPTY");
+    Check(Contents(fresh.Profile(L"EMPTY") / L"bindings-cache.wtf") == current, "only an empty account inherits the configured template");
+    Check(current.find("bind ESCAPE TOGGLEGAMEMENU") != std::string::npos, "template inheritance includes the source Escape binding"); }
 }
 void SetupTests(zp::Session &session) {
   const auto oldBars = session.bars;
@@ -206,12 +302,17 @@ void Tests(const zp::fs::path &root) {
   currentConnection = &connection;
   sessions.clear(); sessions[&connection].account = L"TESTACCOUNT";
   auto &session = sessions[&connection];
+  uint32_t auth = 0;
+  auto authBytes = Message(0x1EE, &auth, sizeof(auth), 2); auto authPacket = Wrap(authBytes, true);
+  DispatchHook(&connection, nullptr, 7, &authPacket);
+  Check(received == 1 && store->problem.empty() && authPacket.read == 0, "borrowed server authentication response forwards unchanged for an isolated account");
+  received = 0; // The remaining checks count character/session traffic.
   uint64_t guid = 42;
   auto loginBytes = Message(zp::PlayerLogin, &guid, sizeof(guid), 4); auto login = Wrap(loginBytes);
   SendHook(&connection, nullptr, &login);
   Check(sent == 1 && session.guid == guid, "login forwards and captures exact character GUID");
   zp::Bars official{}; official[0] = 133; official[1] = 0x40000007;
-  auto barsBytes = Message(zp::ActionButtons, official.data(), sizeof(official), 2); auto barsPacket = Wrap(barsBytes);
+  auto barsBytes = Message(zp::ActionButtons, official.data(), sizeof(official), 2); auto barsPacket = Wrap(barsBytes, true);
   DispatchHook(&connection, nullptr, 7, &barsPacket);
   Check(received == 1 && session.ready && delivered == official, "server action bars seed first profile");
   uint8_t edit[5]{0}; uint32_t action = 116;
@@ -234,16 +335,22 @@ void Tests(const zp::fs::path &root) {
   auto toggleBytes = Message(zp::ActionBarToggles, &toggle, 1, 4); auto togglePacket = Wrap(toggleBytes);
   SendHook(&connection, nullptr, &togglePacket);
   Check(sent == 2, "bar-layout server writes blocked");
-  uint32_t times[8]{1,2,3,4,5,6,7,8};
-  auto timeBytes = Message(zp::AccountDataTimes, times, sizeof(times), 2); auto timePacket = Wrap(timeBytes);
-  DispatchHook(&connection, nullptr, 7, &timePacket);
-  bool zero = true; for (size_t i = 2; i < timeBytes.size(); ++i) zero = zero && !timeBytes[i];
-  Check(zero && received == 2, "account timestamps cannot override the local clone");
-  auto downloadBytes = Message(zp::ServerAccountData, &action, 4, 2); auto downloadPacket = Wrap(downloadBytes);
+  uint8_t times[128]{}; std::memset(times, 0xEE, sizeof(times));
+  auto timeBytes = Message(zp::AccountDataTimes, times, sizeof(times), 2); auto timePacket = Wrap(timeBytes, true);
+  { PlayerFixture client; digestReads = 0; DispatchHook(&connection, nullptr, 7, &timePacket); }
+  bool local = true;
+  for (size_t i = 0; i < 128; ++i) local = local && timeBytes[i + 2] == static_cast<uint8_t>(i + 1);
+  Check(local && received == 2 && digestReads == 8, "eight local MD5 digests preserve cache initialization without server imports");
+  uint8_t wrong[32]{};
+  auto wrongBytes = Message(zp::AccountDataTimes, wrong, sizeof(wrong), 2); auto wrongPacket = Wrap(wrongBytes, true);
+  DispatchHook(&connection, nullptr, 7, &wrongPacket);
+  Check(received == 2 && !store->problem.empty(), "unsupported timestamp-shaped packets still fail closed");
+  store->problem.clear();
+  auto downloadBytes = Message(zp::ServerAccountData, &action, 4, 2); auto downloadPacket = Wrap(downloadBytes, true);
   DispatchHook(&connection, nullptr, 7, &downloadPacket);
   Check(received == 2, "server cache payloads do not overwrite isolated settings");
   auto newer = official; newer[2] = 999;
-  barsBytes = Message(zp::ActionButtons, newer.data(), sizeof(newer), 2); barsPacket = Wrap(barsBytes);
+  barsBytes = Message(zp::ActionButtons, newer.data(), sizeof(newer), 2); barsPacket = Wrap(barsBytes, true);
   DispatchHook(&connection, nullptr, 7, &barsPacket);
   Check(delivered[0] == 116 && delivered[2] == 0, "future logins preserve isolated slots");
   Check(store->LoadBars(L"TESTACCOUNT", guid, true, saved) && saved[2] == 999, "latest server baseline retained for Revert");
@@ -332,7 +439,10 @@ int wmain(int argc, wchar_t **argv) {
     if (argc == 3 && std::wstring(argv[1]) == L"--crash") return CrashChild(argv[2]);
     wchar_t executable[32768]{}; GetModuleFileNameW(nullptr, executable, 32768);
     auto root = zp::fs::absolute(zp::fs::path(executable).parent_path() / L"../.test-data" / std::to_wstring(GetTickCount64()));
+    PacketWindowTests();
     Fixture(root);
+    UsernameHistoryTests(root);
+    BindingTemplateTests(root);
     Tests(root);
     store.reset(); sessions.clear();
     AbruptExit(root, executable);

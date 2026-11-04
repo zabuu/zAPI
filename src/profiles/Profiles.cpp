@@ -3,6 +3,8 @@
 #include "Setups.h"
 #include <memory>
 #include "Profiles.h"
+#include "../login/UsernameHistory.h"
+#include "LoginUI.h"
 
 namespace zprofiles {
 uintptr_t image = 0;
@@ -20,6 +22,9 @@ using LuaString = const char *(__fastcall *)(void *, int);
 using PushString = void(__fastcall *)(void *, const char *);
 using PushNumber = void(__fastcall *)(void *, double);
 CFunction originalGetToggles = nullptr;
+CFunction originalSavedName = nullptr, originalSetSavedName = nullptr;
+void *loginUIState = nullptr;
+bool loginUIBusy = false, historySeeded = false;
 struct Packet { void *vtable; uint8_t *buffer; uint32_t base, allocated, size, read; };
 static_assert(sizeof(Packet) == 24, "WoW 1.12 is x86 only");
 using Send = void(__fastcall *)(void *, void *, Packet *);
@@ -79,10 +84,17 @@ std::wstring CurrentAccount() {
 }
 bool View(Packet *packet, uint8_t **data, size_t *length) noexcept {
   __try {
-    if (!packet || !packet->buffer || packet->read < packet->base || packet->read > packet->size || packet->allocated > 16 * 1024 * 1024) return false;
+    if (!packet || !packet->buffer || packet->read < packet->base || packet->read > packet->size) return false;
+    // CDataStore uses UINT32_MAX for a borrowed buffer, including incoming
+    // login/auth packets. It is an ownership marker, not a 4 GiB allocation.
+    // Bound the logical window in either mode, and check capacity only when
+    // the store owns its buffer. Cursor/base checks above prevent underflow.
+    const uint32_t extent = packet->size - packet->base;
+    if (extent > 16 * 1024 * 1024) return false;
+    if (packet->allocated != 0xFFFFFFFFu &&
+        (packet->allocated > 16 * 1024 * 1024 || extent > packet->allocated)) return false;
     const uint32_t offset = packet->read - packet->base;
     const uint32_t remaining = packet->size - packet->read;
-    if (offset > packet->allocated || remaining > packet->allocated - offset) return false;
     *data = packet->buffer + offset;
     *length = remaining;
     return remaining != 0;
@@ -146,6 +158,21 @@ void __fastcall SendHook(void *connection, void *edx, Packet *packet) {
     catch (...) { forward = !zp::SettingsUpload(opcode); Fault("Unexpected outgoing settings failure."); }
   if (forward) originalSend(connection, edx, packet);
 }
+bool LocalCacheDigests(uint8_t *output) noexcept {
+  using Digest = void(__fastcall *)(uint8_t, const char *, uint8_t *);
+  __try {
+    // Match the exact eight file kinds/names and MD5 routine used by the
+    // client's 0x5AF8E0 handler. File hooks select this account's local clone.
+    auto table = At<const uint8_t *>(0x0085DCF0);
+    for (unsigned i = 0; i < 8; ++i) {
+      auto row = table + i * 0x2C;
+      auto name = *reinterpret_cast<const char *const *>(row + 8);
+      if (!name) return false;
+      At<Digest>(0x005AF940)(row[0], name, output + i * 16);
+    }
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 void __fastcall DispatchHook(void *connection, void *edx, uint32_t argument, Packet *packet) {
   bool forward = true;
   uint32_t opcode = 0;
@@ -163,7 +190,11 @@ void __fastcall DispatchHook(void *connection, void *edx, uint32_t argument, Pac
       auto &session = Session(connection);
       if (store->Isolated(session.account)) {
         forward = false; // a failed import must not replace the local profile
-        forward = session.Receive(*store, opcode, data + 2, length - 2);
+        if (opcode == zp::AccountDataTimes) {
+          uint8_t digests[128]{};
+          if (length != 130 || !LocalCacheDigests(digests)) throw std::runtime_error("Cannot initialize local account-data checksums.");
+          forward = session.Receive(*store, opcode, data + 2, length - 2, digests);
+        } else forward = session.Receive(*store, opcode, data + 2, length - 2);
         if (opcode == zp::ActionButtons && forward) {
           replayPrototype = *packet; replayConnection = connection;
           replayArgument = argument; replayGuid = session.guid;
@@ -251,6 +282,11 @@ int __fastcall Bridge(void *L) {
     if (command == "setupVersion") { Number(L, 1); return 1; }
     std::lock_guard<std::recursive_mutex> lock(store->mutex);
     auto current = CurrentSession();
+    if (command == "bindingTemplate") { Text(L, zp::Utf8(store->BindingTemplate())); return 1; }
+    if (command == "setBindingTemplate") {
+      store->SetBindingTemplate(zp::Wide(Argument(L, 2)));
+      return Reply(L, true, "Default keybindings will be seeded from " + zp::Utf8(store->BindingTemplate()) + ".");
+    }
     auto account = current ? current->account : CurrentAccount();
     if (command == "setups" || command == "saveSetup" || command == "updateSetup" || command == "saveSetupUndo" ||
         command == "setupBindings" || command == "setupUndoBindings" || command == "applySetup" || command == "applySetupUndo" ||
@@ -391,7 +427,72 @@ int __fastcall GetTogglesHook(void *L) {
   } catch (...) { Fault("Cannot apply local bar-layout flags."); }
   return originalGetToggles(L);
 }
+int __fastcall LoginHistoryBridge(void *L) {
+  bool listing = false;
+  try {
+    const auto command = Argument(L, 1);
+    listing = command == "list";
+    if (command == "version") { Number(L, 1); return 1; }
+    zlogin::UsernameHistory history(store->game);
+    if (command == "list") {
+      std::string names;
+      for (const auto &name : history.Names()) names += name + "\n";
+      Text(L, names); Number(L, 1); return 2;
+    }
+    if (command == "clear") { history.Clear(); Number(L, 1); return 1; }
+  } catch (...) { Log("Username history unavailable; login and profile protection are unchanged."); }
+  if (listing) { Text(L, ""); Number(L, 0); return 2; }
+  Number(L, 0); return 1;
+}
+void InstallLoginUI(void *L) {
+  if (loginUIBusy || loginUIState == L) return;
+  using GetTop = int(__fastcall *)(void *);
+  using SetTop = void(__fastcall *)(void *, int);
+  using LoadBuffer = int(__fastcall *)(void *, const char *, unsigned, const char *);
+  using PCall = int(__fastcall *)(void *, int, int, int);
+  using ToNumber = double(__fastcall *)(void *, int);
+  const auto top = At<GetTop>(0x006F3070)(L);
+  loginUIBusy = true;
+  // This is a fixed, embedded UI chunk. Never compile disk/account contents.
+  const int compiled = At<LoadBuffer>(0x006F5690)(L, kLoginUI, sizeof(kLoginUI) - 1, "@zAPI/LoginHistory");
+  const int status = compiled ? compiled : At<PCall>(0x006F41A0)(L, 0, 1, 0);
+  if (!status && At<LuaType>(0x006F3400)(L, -1) == 3 && At<ToNumber>(0x006F3620)(L, -1) == 1)
+    loginUIState = L;
+  if (status) { loginUIState = L; Log("Login history UI could not initialize; ordinary login remains available."); }
+  At<SetTop>(0x006F3080)(L, top); // Preserve the original getter's result and args.
+  loginUIBusy = false;
+}
+int __fastcall SavedNameHook(void *L) {
+  const int results = originalSavedName(L);
+  if (!historySeeded) {
+    historySeeded = true;
+    try {
+      if (results == 1 && store) zlogin::UsernameHistory(store->game).Remember(Argument(L, -1), true);
+    } catch (...) { Log("Saved username history could not be seeded."); }
+  }
+  InstallLoginUI(L);
+  return results;
+}
+int __fastcall SetSavedNameHook(void *L) {
+  // This existing client API receives only the username, never the password.
+  std::string name;
+  try { name = Argument(L, 1); } catch (...) {}
+  const int results = originalSetSavedName(L);
+  try {
+    if (!name.empty() && store) zlogin::UsernameHistory(store->game).Remember(name);
+  } catch (...) { Log("Username could not be remembered; ordinary login remains available."); }
+  return results;
+}
 CFunction WrapFunction(const char *name, CFunction function) {
+  if (name && !std::strcmp(name, "GetSavedAccountName") && function != &SavedNameHook) {
+    originalSavedName = function;
+    loginUIState = nullptr;
+    return &SavedNameHook;
+  }
+  if (name && !std::strcmp(name, "SetSavedAccountName") && function != &SetSavedNameHook) {
+    originalSetSavedName = function;
+    return &SetSavedNameHook;
+  }
   if (name && !std::strcmp(name, "GetActionBarToggles") && function == At<CFunction>(0x004E7660)) {
     originalGetToggles = function;
     return &GetTogglesHook;
@@ -399,6 +500,10 @@ CFunction WrapFunction(const char *name, CFunction function) {
   return function;
 }
 void OnRegistered(const char *name, Register registerFunction) {
+  if (name && !std::strcmp(name, "GetSavedAccountName")) {
+    registerFunction("zLoginHistory", &LoginHistoryBridge);
+    registerFunction("zLoginCreateFrame", At<CFunction>(0x007060B0));
+  }
   // Preserve the established glue/world/reload registration points.
   if (name && (!std::strcmp(name, "GetBuildInfo") || !std::strcmp(name, "GetCVar") || !std::strcmp(name, "UnitName")))
     registerFunction("zProfilesNative", &Bridge);
@@ -435,7 +540,7 @@ DWORD Prepare() {
       !zp::files::Install(store.get())) {
     throw std::runtime_error("Protection could not be installed completely. Startup stopped before login.");
   }
-  Log("zAPI 3.2 profile protection prepared; account modes default unless explicitly isolated.");
+  Log("zAPI 3.4 profile protection prepared; account modes default unless explicitly isolated.");
   return 0;
 }
 void ProcessDetach(bool processExit) {

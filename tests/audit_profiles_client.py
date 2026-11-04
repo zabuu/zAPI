@@ -43,6 +43,13 @@ def audit(path):
     signature(0x4E7686, '8b 80 68 0e 00 00 8a 98 2a 10 00 00')
     # The stock setter composes four low bits then sends opcode 0x2BF.
     signature(0x4E771D, '68 bf 02 00 00')
+    # Login UI executes a fixed Lua chunk in the caller's glue state.
+    signature(0x6F5690, '55 8b ec 83 ec 08 8b 45 08 83 f8 03 72 17 80 3a')
+    signature(0x6F41A0, '55 8b ec 83 ec 08 8b 45 0c 85 c0 56 57 75 04 33')
+    # Account-data initialization consumes eight 16-byte MD5 entries.
+    signature(0x5AF901, '6a 10 8d 4d f0 51 8b cb e8')
+    signature(0x5AF920, '83 c6 2c 47 81 fe 50 de 85 00')
+    signature(0x5AF940, '55 8b ec 81 ec 58 04 00 00 56 57 8b 7d 08 33 c0')
     # ReloadUI's client loop runs native teardown and complete initialization.
     call(0x495664, 0x490BD0)
     call(0x495669, 0x48FBF0)
