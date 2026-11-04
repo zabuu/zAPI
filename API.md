@@ -43,6 +43,12 @@ cameraX, cameraY, cameraZ, forwardX, forwardY, forwardZ,
 Projected `x` and `y` are normalized with a bottom-left origin, ready to map
 through `UIParent:GetWidth()` and `UIParent:GetHeight()`. `depth` is distance
 along the live camera forward vector and can be used for perspective scaling.
+Multiply each normalized axis by its UIParent dimension exactly once. Do not
+apply an additional `WorldFrame:GetEffectiveScale()/UIParent:GetEffectiveScale()`
+factor to these values. A frame with its own scale still needs the ordinary
+conversion from UIParent units to that frame's units when setting its anchor.
+The scalar and batched projection commands, including `projectLine`, share
+this screen-coordinate contract; world-position values remain in world units.
 `losPosition` returns the unit base position raised by its collision-box height,
 matching the eye point used by UnitXP/ClassicAPI line-of-sight traces.
 
