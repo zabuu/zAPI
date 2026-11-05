@@ -1,4 +1,4 @@
-# Profile module (zAPI 3.5)
+# Profile module (zAPI 3.6)
 
 The zProfiles native module is part of **zAPI.dll**. Install that single DLL
 first in `dlls.txt`, remove the old `zProfilesNative.dll` loader entry, and
@@ -49,7 +49,18 @@ diagnostics. Every unconfigured account remains Default. Modes take effect
 after a full client restart. Removing only the Lua addon does not disable
 native isolation: select Use Default for isolated accounts before removing it.
 
-Validation includes 146 native profile checks with actual Win32 file detours,
+`zProfilesNative("setupExtrasVersion")` returns `1`. Save, Update and
+`saveSetupUndo` accept an optional fourth argument containing the bounded
+plain-text `ZPR1` zPie slot payload. `setupBindings` / `setupUndoBindings`
+return `(1, bindings, piePayload)`; absent ring data returns an empty string.
+Apply accepts both returned payloads and verifies they still match the file
+before changing native bars. Version-2 files length-prefix the binding section
+and include ring data in the checksum and atomic write. Version-1 files remain
+readable; they leave zPie unchanged. Rename, Delete, backups and forced-exit
+durability retain the complete snapshot. Lua validates and applies the ring
+schema; the native bridge never executes payload text.
+
+Validation includes 157 native profile checks with actual Win32 file detours,
 generated account fixtures and forced process termination; the shared
 registration/reload/render-chain fixture; and the addon Lua regression suite.
 No test uses real account data. Live login, interoperability and remote server

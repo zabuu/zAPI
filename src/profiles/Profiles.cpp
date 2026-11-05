@@ -222,11 +222,12 @@ bool ReadLiveBars(uint64_t guid, zp::Bars &bars) noexcept {
     return true;
   } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-zp::Setup CaptureSetup(const zp::Session &session, const std::string &bindings) {
+zp::Setup CaptureSetup(const zp::Session &session, const std::string &bindings, const std::string &pie = {}) {
   zp::Setup setup;
   if (!ReadLiveBars(session.guid, setup.bars)) throw std::runtime_error("Live action bars are not available for saving.");
   setup.toggles = session.toggles;
   setup.bindings = bindings;
+  setup.pie = pie;
   return setup;
 }
 bool DeliverBars(zp::Session &session, const zp::Bars &bars) {
@@ -304,6 +305,7 @@ int __fastcall Bridge(void *L) {
     if (command == "version") { Number(L, 1); return 1; }
     if (command == "setupVersion") { Number(L, 1); return 1; }
     if (command == "liveBarsVersion") { Number(L, 1); return 1; }
+    if (command == "setupExtrasVersion") { Number(L, 1); return 1; }
     std::lock_guard<std::recursive_mutex> lock(store->mutex);
     auto current = CurrentSession();
     if (command == "bindingTemplate") { Text(L, zp::Utf8(store->BindingTemplate())); return 1; }
@@ -332,19 +334,20 @@ int __fastcall Bridge(void *L) {
       if (command == "saveSetup" || command == "updateSetup" || command == "saveSetupUndo") {
         if (command == "saveSetup" && zp::fs::exists(path)) return Reply(L, false, "That name already exists. Select it and use Update, or choose another name.");
         if (command == "updateSetup" && !zp::fs::exists(path)) return Reply(L, false, "The selected setup no longer exists.");
-        auto setup = CaptureSetup(*current, Argument(L, 3));
+        auto setup = CaptureSetup(*current, Argument(L, 3), Argument(L, 4));
         zp::WriteSetup(*store, path, setup);
         return Reply(L, true, undo ? "Undo saved." : "Saved setup: " + zp::Utf8(name));
       }
       if (command == "setupBindings" || command == "setupUndoBindings") {
         auto setup = zp::ReadSetup(path);
-        Number(L, 1); Text(L, setup.bindings); return 2;
+        Number(L, 1); Text(L, setup.bindings); Text(L, setup.pie); return 3;
       }
       if (command == "applySetup" || command == "applySetupUndo") {
         auto setup = zp::ReadSetup(path);
-        if (setup.bindings != Argument(L, 3)) return Reply(L, false, "The setup changed while loading. Try again.");
+        if (setup.bindings != Argument(L, 3) || setup.pie != Argument(L, 4))
+          return Reply(L, false, "The setup changed while loading. Try again with the current zProfiles addon.");
         ApplySetup(*current, setup);
-        return Reply(L, true, undo ? "Previous bars and bindings restored." : "Applied setup: " + zp::Utf8(name));
+        return Reply(L, true, undo ? "Previous setup restored." : "Applied setup: " + zp::Utf8(name));
       }
       if (command == "renameSetup") {
         zp::RenameSetup(*store, path, zp::SetupPath(*store, account, current->guid, zp::Wide(Argument(L, 3))));
@@ -572,7 +575,7 @@ DWORD Prepare() {
       !zp::files::Install(store.get())) {
     throw std::runtime_error("Protection could not be installed completely. Startup stopped before login.");
   }
-  Log("zAPI 3.5 profile protection prepared; account modes default unless explicitly isolated.");
+  Log("zAPI 3.6 profile protection prepared; account modes default unless explicitly isolated.");
   return 0;
 }
 void ProcessDetach(bool processExit) {

@@ -425,3 +425,17 @@ of the live table must match the target before success is returned. Save and
 Undo capture live slots, and failed application restores the prior live state.
 The previous packet replay only changed a login seed and could report success
 without changing playing characters' bars. Existing saved setups remain usable.
+
+## Version 3.6: zPie ring-slot snapshots
+
+`zAPI("version")` returns `3.6` and
+`zProfilesNative("setupExtrasVersion")` returns `1`. Named setup Save, Update
+and Undo accept ring-slot data as their fourth argument. The binding-load
+commands return `(1, bindings, piePayload)`, and Apply receives both payloads
+to verify the snapshot has not changed. An empty ring payload preserves zPie.
+
+Ring data is stored in a checked, bounded version-2 snapshot beside bars and
+bindings, flushed without waiting for SavedVariables. Version-1 snapshots stay
+readable. zProfiles 0.4.0 parses the data and restores the current character's
+ring assignments through zPie's live table/refresh methods; it does not switch
+zPie's saved profiles or capture appearance settings or macro definitions.

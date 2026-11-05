@@ -219,6 +219,43 @@ void SetupTests(zp::Session &session) {
   zp::WriteSetup(*store, path, setup);
   auto loaded = zp::ReadSetup(path);
   Check(loaded.bars == setup.bars && loaded.toggles == 5 && loaded.bindings == bindings, "setup round trip retains all 120 slots, flags and secondary bindings");
+  Check(loaded.pie.empty(), "legacy setup round trip leaves ring slots unspecified");
+  const std::string pie = "ZPR1\n11\n1\t8\tMACRO\t4275727374\t\t7\t0\n";
+  auto ringSetup = setup; ringSetup.pie = pie;
+  auto ringPath = zp::SetupPath(*store, session.account, session.guid, L"Rings");
+  zp::WriteSetup(*store, ringPath, ringSetup);
+  auto ringLoaded = zp::ReadSetup(ringPath);
+  Check(ringLoaded.pie == pie && ringLoaded.bindings == bindings && ringLoaded.bars == setup.bars,
+    "version-2 setup keeps ring slots, bindings and all live bars together");
+  auto ringRaw = zp::ReadBytes(ringPath);
+  Check(std::memcmp(ringRaw.data(), "ZPSET2\n", 7) == 0, "ring snapshot uses the explicit version-2 format");
+  bool ringRefused = false;
+  auto badRings = ringSetup; badRings.pie = "return malicious()";
+  try { zp::WriteSetup(*store, ringPath, badRings); } catch (...) { ringRefused = true; }
+  Check(ringRefused && zp::ReadSetup(ringPath).pie == pie, "unsupported ring payload never overwrites the saved setup");
+  ringRefused = false; badRings.pie = "ZPR1\n1\n"; badRings.pie.push_back('\0'); badRings.pie += '\n';
+  try { zp::WriteSetup(*store, ringPath, badRings); } catch (...) { ringRefused = true; }
+  Check(ringRefused, "embedded NUL cannot truncate ring data across the Lua bridge");
+  ringRefused = false; badRings.pie = "ZPR1\n" + std::string(1024 * 1024, 'x') + "\n";
+  try { zp::WriteSetup(*store, ringPath, badRings); } catch (...) { ringRefused = true; }
+  Check(ringRefused, "ring payloads retain a size limit");
+  // A valid checksum must not allow an out-of-bounds binding length.
+  auto damaged = ringRaw;
+  const uint32_t impossibleLength = 0xFFFFFFFFu;
+  std::memcpy(damaged.data() + 7 + sizeof(zp::Bars) + 1, &impossibleLength, sizeof(impossibleLength));
+  std::string damagedBody(damaged.begin(), damaged.end() - 4);
+  auto damageChecksum = zp::SetupChecksum(damagedBody);
+  std::memcpy(damaged.data() + damagedBody.size(), &damageChecksum, 4);
+  zp::AtomicWrite(ringPath, damaged.data(), damaged.size());
+  ringRefused = false;
+  try { zp::ReadSetup(ringPath); } catch (...) { ringRefused = true; }
+  Check(ringRefused, "version-2 length is checked before extracting binding and ring payloads");
+  zp::WriteSetup(*store, ringPath, ringSetup);
+  auto ringRenamed = zp::SetupPath(*store, session.account, session.guid, L"Renamed Rings");
+  zp::RenameSetup(*store, ringPath, ringRenamed);
+  Check(zp::ReadSetup(ringRenamed).pie == pie, "Rename preserves ring assignments");
+  zp::DeleteSetup(*store, ringRenamed);
+  Check(!zp::fs::exists(ringRenamed), "Delete archives ring snapshots with their complete contents");
   auto separate = zp::SetupPath(*store, session.account, 43, L"Frost");
   Check(!zp::fs::exists(separate), "another character cannot see this character's named setup");
   auto undoPath = zp::SetupPath(*store, session.account, session.guid, L"", true);
@@ -258,9 +295,10 @@ void SetupTests(zp::Session &session) {
     unsavedBars[0] = unsavedBars[1] = 0; // removed spell and macro
     unsavedBars[8] = 77; // unsaved extra spell, absent in the named setup
     std::memcpy(At<void *>(0xBC6980), unsavedBars.data(), sizeof(unsavedBars));
-    const auto unsaved = CaptureSetup(session, bindings);
+    const auto unsaved = CaptureSetup(session, bindings, pie);
     Check(unsaved.bars == unsavedBars && unsaved.bars != session.bars,
       "Save and Undo capture the visible live slots even when the session journal differs");
+    Check(unsaved.pie == pie, "Save and Undo retain the Lua-captured ring slots beside live bars");
     zp::WriteSetup(*store, undoPath, unsaved);
     const auto stagedBefore = delivered;
     liveWrites = actionUploads = perSlotEvents = fullBarEvents = 0; invalidBarEvent = false;
@@ -467,7 +505,7 @@ int CrashChild(const zp::fs::path &root) {
   Write(store->original / L"TESTACCOUNT/macros-cache.txt", "crash-session macro");
   zp::Bars bars{}; bars[3] = 12345;
   store->SaveBars(L"TESTACCOUNT", 42, false, bars);
-  zp::Setup setup{bars, 7, "ZPB1\n31\t414354494f4e425554544f4e31\n"};
+  zp::Setup setup{bars, 7, "ZPB1\n31\t414354494f4e425554544f4e31\n", "ZPR1\n11\n1\t8\tMACRO\t4275727374\t\t7\t0\n"};
   zp::WriteSetup(*store, zp::SetupPath(*store, L"TESTACCOUNT", 42, L"Crash saved"), setup);
   // Deliberately bypass destructors and every logout/save event.
   TerminateProcess(GetCurrentProcess(), 123);
@@ -490,6 +528,7 @@ void AbruptExit(const zp::fs::path &root, const std::wstring &executable) {
   Check(restarted.LoadBars(L"TESTACCOUNT", 42, false, bars) && bars[3] == 12345, "action checkpoint survives forced termination and restart");
   auto setup = zp::ReadSetup(zp::SetupPath(restarted, L"TESTACCOUNT", 42, L"Crash saved"));
   Check(setup.bars[3] == 12345 && setup.toggles == 7 && setup.bindings == "ZPB1\n31\t414354494f4e425554544f4e31\n", "explicitly saved setups survive process termination without logout");
+  Check(setup.pie == "ZPR1\n11\n1\t8\tMACRO\t4275727374\t\t7\t0\n", "saved ring assignments survive forced termination without SavedVariables or logout");
   zp::AtomicWrite(restarted.data / L"modes.txt", "corrupt registry");
   bool refused = false;
   try { zp::Store invalid(root); } catch (...) { refused = true; }

@@ -6,6 +6,7 @@ struct Setup {
   Bars bars{};
   uint8_t toggles = 0;
   std::string bindings;
+  std::string pie;
 };
 inline bool SetupName(const std::wstring &name) {
   if (!Segment(name) || name.size() > 32 || name.front() == L' ' || name.back() == L' ') return false;
@@ -37,6 +38,15 @@ inline uint32_t SetupChecksum(const std::string &bytes) {
   for (unsigned char c : bytes) { hash ^= c; hash *= 16777619u; }
   return hash;
 }
+inline void ValidatePie(const std::string &text) {
+  if (text.empty()) return; // Legacy setups do not change ring assignments.
+  if (text.size() > 1024 * 1024 || text.compare(0, 5, "ZPR1\n") || text.back() != '\n')
+    throw std::runtime_error("Invalid zPie setup payload.");
+  // Lua validates the versioned ring/slot schema. The native store handles
+  // bounded plain data only; neither layer evaluates snapshot contents.
+  for (unsigned char c : text) if (c != '\n' && c != '\t' && (c < 32 || c > 126))
+    throw std::runtime_error("Invalid zPie setup payload.");
+}
 inline fs::path SetupDirectory(Store &store, const std::wstring &account, uint64_t guid) {
   if (!guid) throw std::runtime_error("Log in to a character before managing setups.");
   store.EnsureProfile(account);
@@ -51,9 +61,10 @@ inline fs::path SetupPath(Store &store, const std::wstring &account, uint64_t gu
   return path;
 }
 inline Setup ReadSetup(const fs::path &path) {
-  auto raw = ReadBytes(path, 257 * 1024);
+  auto raw = ReadBytes(path, 1281 * 1024);
   const size_t prefix = 7 + sizeof(Bars) + 1;
-  if (raw.size() < prefix + 5 + sizeof(uint32_t) || std::memcmp(raw.data(), "ZPSET1\n", 7))
+  if (raw.size() < prefix + 5 + sizeof(uint32_t) ||
+      (std::memcmp(raw.data(), "ZPSET1\n", 7) && std::memcmp(raw.data(), "ZPSET2\n", 7)))
     throw std::runtime_error("Invalid setup file; it was not applied.");
   std::string bytes(raw.begin(), raw.end() - sizeof(uint32_t));
   uint32_t checksum = 0;
@@ -63,18 +74,33 @@ inline Setup ReadSetup(const fs::path &path) {
   std::memcpy(setup.bars.data(), raw.data() + 7, sizeof(Bars));
   setup.toggles = raw[7 + sizeof(Bars)];
   if (setup.toggles > 15) throw std::runtime_error("Invalid setup bar visibility.");
-  setup.bindings = bytes.substr(prefix);
+  if (raw[5] == '1') setup.bindings = bytes.substr(prefix);
+  else {
+    uint32_t length = 0;
+    if (bytes.size() < prefix + sizeof(length)) throw std::runtime_error("Truncated setup file.");
+    std::memcpy(&length, raw.data() + prefix, sizeof(length));
+    if (length > bytes.size() - prefix - sizeof(length)) throw std::runtime_error("Truncated setup bindings.");
+    setup.bindings = bytes.substr(prefix + sizeof(length), length);
+    setup.pie = bytes.substr(prefix + sizeof(length) + length);
+  }
   ValidateBindings(setup.bindings);
+  ValidatePie(setup.pie);
   return setup;
 }
 inline void WriteSetup(Store &store, const fs::path &path, const Setup &setup) {
   Bypass guard;
   ValidateBindings(setup.bindings);
+  ValidatePie(setup.pie);
   if (setup.toggles > 15) throw std::runtime_error("Invalid setup bar visibility.");
-  std::string bytes("ZPSET1\n");
+  std::string bytes(setup.pie.empty() ? "ZPSET1\n" : "ZPSET2\n");
   bytes.append(reinterpret_cast<const char *>(setup.bars.data()), sizeof(Bars));
   bytes.push_back(static_cast<char>(setup.toggles));
+  if (!setup.pie.empty()) {
+    const auto length = static_cast<uint32_t>(setup.bindings.size());
+    bytes.append(reinterpret_cast<const char *>(&length), sizeof(length));
+  }
   bytes += setup.bindings;
+  bytes += setup.pie;
   auto checksum = SetupChecksum(bytes);
   bytes.append(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
   PlainDirectory(path);
