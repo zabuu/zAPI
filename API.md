@@ -365,6 +365,30 @@ entries, all 40 fixed gate-byte mutations, invalid callbacks/context/body/memory
 permissions and 10,000 validations, plus the existing scoped command/placement
 ABI and exception recovery suites. Live game behavior needs separate validation.
 
+## Version 3.7: native pet spell cast for zPet
+
+`zAPI("version")` returns `3.7`. The pet bridge gains a spell cast that runs in
+the same neutral context as `petCommand`, so the Focus manager in zPet 1.6 can
+cast a ranked special from its timer instead of waiting for a hunter keypress
+(the OctoWoW client silently drops background `CastPetAction` and
+`TogglePetAutocast`).
+
+```lua
+compatible = zAPI("petCastVersion") -- 1 when the pet command bridge is compatible
+submitted, reason = zAPI("petCast", "Bite")            -- target: current pettarget
+submitted, reason = zAPI("petCast", "Bite", unitOrGUID) -- explicit living target
+```
+
+The spell is resolved by name from the pet's own spellbook (highest matching
+id; locale-aware DBC name, rank suffix ignored). The dispatcher receives the
+client's own action-bar encoding, `(0xC1 << 24) | spellId`, with the victim
+GUID, exactly as `CastPetAction` would send it; no caller-supplied opcode or
+foreign spell id reaches it. Rejections (zero plus reason): bridge unavailable,
+not in world, no living pet, spell not in the pet spellbook, invalid explicit
+target. Without an explicit target and without a living pet target the cast is
+sent untargeted and the server applies its own targeting rules. Cooldown,
+Focus and range are validated server side; zPet checks them first.
+
 ## Version 3.2: shared profile module
 
 `zAPI("version")` returns `3.2`; `zAPI("profilesVersion")` returns `1`.

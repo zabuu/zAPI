@@ -1,6 +1,8 @@
 # zAPI
 
-**Native version 3.6 — persists zPie ring assignments alongside zProfiles bar setups.**
+**Native version 3.7 — adds a native pet spell cast for the zPet Focus manager.**
+
+Version 3.7 adds `zAPI("petCast", name[, target])`, which casts a pet spell through the verified pet dispatcher from any addon timer. It retains 3.6 zPie ring-slot snapshots.
 
 Version 3.6 adds optional zPie ring-slot data to the checked, atomically saved setup and Undo files. Existing bar-only setups remain compatible. It retains 3.5 live action-slot restoration, upload suppression, 3.4 cache initialization and existing-binding precedence. Fully restart WoW after replacing the DLL.
 

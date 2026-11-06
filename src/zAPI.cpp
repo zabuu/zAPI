@@ -651,6 +651,86 @@ bool SafePetCommand(const char *command, const char *identifier,
   }
 }
 
+// Highest spell id in the pet spellbook whose DBC name matches. Only the pet's
+// own book is consulted: a name the pet does not know yields 0.
+uint32_t FindPetSpellIdByName(const char *name) {
+  if (!name || name[0] == '\0') return 0;
+  std::string cleanName = name;
+  const size_t paren = cleanName.find('(');
+  if (paren != std::string::npos) cleanName = cleanName.substr(0, paren);
+  while (!cleanName.empty() && (cleanName.back() == ' ' || cleanName.back() == '\t')) cleanName.pop_back();
+  if (cleanName.empty()) return 0;
+  const uintptr_t maxIdAddr = At<uintptr_t>(kSpellDbcMaxId);
+  if (!IsReadable(maxIdAddr, sizeof(uint32_t))) return 0;
+  const uint32_t maxId = *reinterpret_cast<const uint32_t *>(maxIdAddr);
+  const uintptr_t spellTableAddr = At<uintptr_t>(kSpellDbcRecords);
+  if (!IsReadable(spellTableAddr, sizeof(uintptr_t))) return 0;
+  uint32_t **spellTable = *reinterpret_cast<uint32_t ***>(spellTableAddr);
+  if (!spellTable) return 0;
+  const uintptr_t localeAddr = At<uintptr_t>(kLocale);
+  const uint32_t locale = IsReadable(localeAddr, sizeof(uint32_t))
+                              ? *reinterpret_cast<const uint32_t *>(localeAddr) : 0;
+  const uintptr_t petBook = At<uintptr_t>(kPetSpellbook);
+  if (!IsReadable(petBook, 1024 * sizeof(uint32_t))) return 0;
+  const uint32_t *book = reinterpret_cast<const uint32_t *>(petBook);
+  uint32_t bestId = 0;
+  for (int i = 1; i < 1024; ++i) {
+    const uint32_t id = book[i];
+    if (id == 0 || id > maxId) continue;
+    if (!IsReadable(reinterpret_cast<uintptr_t>(&spellTable[id]), sizeof(uint32_t *)) || !spellTable[id]) continue;
+    const uint8_t *rec = reinterpret_cast<const uint8_t *>(spellTable[id]);
+    if (!IsReadable(reinterpret_cast<uintptr_t>(rec), 0x220)) continue;
+    const char *sName = *reinterpret_cast<const char *const *>(rec + 0x1e0 + locale * 4);
+    if (!sName || !IsReadable(reinterpret_cast<uintptr_t>(sName), 1)) continue;
+    if (_stricmp(sName, cleanName.c_str()) == 0 && id > bestId) bestId = id;
+  }
+  return bestId;
+}
+
+// Cast a pet spell through the same fixed dispatcher as the pet commands. The
+// client's CastPetAction sends the action-bar value ((type << 24) | spellId)
+// with a target GUID; this builds that value from the pet's own spellbook, so
+// no caller-supplied opcode or unknown spell reaches the dispatcher.
+bool SafePetCast(const char *name, const char *identifier, const char *&reason) {
+  constexpr uint32_t kActEnabled = 0xC1u << 24;
+  if (!name || !name[0]) { reason = "missing pet spell name"; return false; }
+  __try {
+    if (!PetCommandBridgeAvailable()) {
+      reason = "unsupported pet command dispatcher"; return false;
+    }
+    if (*At<const uint8_t *>(kInWorld) == 0) {
+      reason = "not in world"; return false;
+    }
+    uint32_t pet = 0;
+    if (!ResolveUnit("pet", pet) || !LivingUnit(pet)) {
+      reason = "no living active pet"; return false;
+    }
+    const uint32_t spellId = FindPetSpellIdByName(name);
+    if (spellId == 0 || (spellId & 0xFF000000u) != 0) {
+      reason = "spell not in pet spellbook"; return false;
+    }
+    uint64_t victim = 0;
+    const char *targetToken = (identifier && identifier[0]) ? identifier : "pettarget";
+    uint32_t target = 0;
+    if (ResolveUnit(targetToken, target) && LivingUnit(target) && target != pet) {
+      victim = ResolveGuid(targetToken);
+      if (victim == ResolveGuid("player")) victim = 0;
+    }
+    if (victim == 0 && identifier && identifier[0]) {
+      reason = "invalid pet cast target"; return false;
+    }
+    const bool submitted = DispatchScopedPetCommand(
+        At<PetCommandDispatchFn>(kPetCommandDispatch),
+        At<uint32_t *>(kFrameScriptContext), At<uint32_t *>(kFrameScriptDepth),
+        &g_petCommandBusy, kActEnabled | spellId, victim);
+    if (!submitted) reason = "pet dispatcher busy or native exception";
+    return submitted;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    reason = "native pet cast validation exception";
+    return false;
+  }
+}
+
 bool UnitPosition(uint32_t unit, Vec3 &position) {
   if (!IsReadable(unit, 4)) return false;
   const uint32_t vtable = *reinterpret_cast<uint32_t *>(unit);
@@ -1272,7 +1352,7 @@ int __fastcall Script_zAPI(void *L) {
   }
 
   if (std::strcmp(command, "version") == 0) {
-    LuaPushNumber(L, 3.6);
+    LuaPushNumber(L, 3.7);
     return 1;
   }
   if (std::strcmp(command, "profilesVersion") == 0) {
@@ -1366,6 +1446,20 @@ int __fastcall Script_zAPI(void *L) {
     LuaPushNumber(L, submitted ? 1 : 0);
     if (!submitted) { LuaPushString(L, reason); return 2; }
     LuaPushNumber(L, point.x); LuaPushNumber(L, point.y); LuaPushNumber(L, point.z); return 4;
+  }
+
+  if (std::strcmp(command, "petCastVersion") == 0) {
+    LuaPushNumber(L, PetCommandBridgeAvailable() ? 1.0 : 0.0);
+    return 1;
+  }
+  if (std::strcmp(command, "petCast") == 0) {
+    const char *reason = nullptr;
+    const char *name = LuaGetTop(L) >= 2 ? LuaToString(L, 2) : nullptr;
+    const char *unit = LuaGetTop(L) >= 3 ? LuaToString(L, 3) : nullptr;
+    const bool submitted = SafePetCast(name, unit, reason);
+    LuaPushNumber(L, submitted ? 1.0 : 0.0);
+    if (!submitted) { LuaPushString(L, reason ? reason : "pet cast rejected"); return 2; }
+    return 1;
   }
 
   if (std::strcmp(command, "petCommand") == 0) {
